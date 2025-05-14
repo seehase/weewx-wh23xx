@@ -1,2 +1,15 @@
 *~
 *.pyc
+
+# idea
+.idea
+*.iml
+
+# OSX leaves these everywhere on SMB shares
+._*
+
+# OSX trash
+.DS_Store
+
+# vscode
+.vscode

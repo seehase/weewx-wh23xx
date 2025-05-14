@@ -1,8 +1,12 @@
+
 #!/usr/bin/env python
-# Copyright 2016 Matthew Wall
+# Copyright 2016-2024 Matthew Wall
 # Distributed under the terms of the GNU Public License (GPLv3)
 #
 # Thanks to Lloyd Kinsella
+# 
+# 2024 Edwin Zuidema
+# Modified and tested with Renkforce WH2315
 
 """
 Collect data from Fine Offset WH23xx stations, including:
@@ -11,6 +15,7 @@ Collect data from Fine Offset WH23xx stations, including:
   WH2301 (no RCC)
   WH4000
   Tycon TP2700
+  Renkforce WH2315
 
 Based on the protocol specified in "TP2700 EEPROM data structure" V1.0 with
 serial number FOS-ENG-022-A for model WH2300, and "TP2700 PC Protocol".
@@ -246,17 +251,20 @@ Command Result
     9 RT_INVALID_PARAM
 """
 
-from __future__ import with_statement
-import syslog
+import logging
 import time
+
 import usb
 
 import weewx.drivers
-from weeutil.weeutil import timestamp_to_string, log_traceback
+from weeutil.logger import log_traceback
+from weeutil.weeutil import timestamp_to_string
 from weewx.wxformulas import calculate_rain
 
+log = logging.getLogger(__name__)
+
 DRIVER_NAME = 'WH23xx'
-DRIVER_VERSION = '0.14'
+DRIVER_VERSION = '0.15EZ'
 
 def loader(config_dict, _):
     return WH23xxDriver(**config_dict[DRIVER_NAME])
@@ -264,18 +272,14 @@ def loader(config_dict, _):
 def confeditor_loader():
     return WH23xxConfigurationEditor()
 
-
-def logmsg(level, msg):
-    syslog.syslog(level, 'wh23xx: %s' % msg)
-
 def logdbg(msg):
-    logmsg(syslog.LOG_DEBUG, msg)
+    log.debug(msg)
 
 def loginf(msg):
-    logmsg(syslog.LOG_INFO, msg)
+    log.info(msg)
 
 def logerr(msg):
-    logmsg(syslog.LOG_ERR, msg)
+    log.error(msg)
 
 
 LUMINOSITY_TO_RADIATION = 0.0079
@@ -393,11 +397,11 @@ class WH23xxConfigurationEditor(weewx.drivers.AbstractConfEditor):
 
 class WH23xxDriver(weewx.drivers.AbstractDevice):
     def __init__(self, **stn_dict):
-        loginf('driver version is %s' % DRIVER_VERSION)
-        loginf('usb info: %s' % get_usb_info())
+        loginf('init: driver version is %s' % DRIVER_VERSION)
+        loginf('init: usb info: %s' % get_usb_info())
         self._model = stn_dict.get('model', 'Tycon TP2700')
         self._poll_interval = int(stn_dict.get('poll_interval', 15))
-        loginf('poll interval is %s' % self._poll_interval)
+        loginf('init: poll interval is %s seconds' % self._poll_interval)
         self.max_tries = int(stn_dict.get('max_tries', 5))
         self.retry_wait = int(stn_dict.get('retry_wait', 10))
         self._debug_rain = int(stn_dict.get('debug_rain', 0))
@@ -415,18 +419,18 @@ class WH23xxDriver(weewx.drivers.AbstractDevice):
     def genLoopPackets(self):
         while True:
             raw = self._get_current()
-            logdbg("raw data: %s" % raw)
+            logdbg("genLoopPackets: raw data: %s" % raw)
             if raw:
                 try:
                     decoded = WH23xxStation.decode_weather_data(raw)
-                    logdbg("decoded data: %s" % decoded)
+                    logdbg("genLoopPackets: decoded data: %s" % decoded)
                     if decoded:
                         packet = self._data_to_packet(decoded)
-                        logdbg("packet: %s" % packet)
+                        logdbg("genLoopPackets: packet: %s" % packet)
                         yield packet
-                except IndexError, e:
-                    logerr("decode failed: %s (%s)" % (e, _fmt(raw)))
-                    log_traceback(loglevel=syslog.LOG_DEBUG)
+                except IndexError as e:
+                    logerr("genLoopPackets: decode failed: %s (%s)" % (e, _fmt(raw)))
+                    log_traceback(log.debug)
             time.sleep(self._poll_interval)
 
     def _get_current(self):
@@ -435,18 +439,18 @@ class WH23xxDriver(weewx.drivers.AbstractDevice):
             ntries += 1
             try:
                 return self._station.get_current()
-            except usb.USBError, e:
+            except usb.USBError as e:
                 if known_usb_err(e):
                     logdbg("get_current: %s" % e)
                     ntries -= 1
                 else:
                     logerr("get_current: failed attempt %d of %d: %s" %
                            (ntries, self.max_tries, e))
-            except weewx.WeeWxIOError, e:
+            except weewx.WeeWxIOError as e:
                 logerr("get_current: failed attempt %d of %d: %s" %
                        (ntries, self.max_tries, e))
             time.sleep(self.retry_wait)
-        msg = "read failed: max retries (%d) exceeded" % self.max_tries
+        msg = "get_current: read failed: max retries (%d) exceeded" % self.max_tries
         logerr(msg)
         raise weewx.RetriesExceeded(msg)
 
@@ -468,7 +472,11 @@ class WH23xxDriver(weewx.drivers.AbstractDevice):
         pkt['uv_raw'] = data.get('uv', {}).get('value')
         pkt['UV'] = data.get('uvi', {}).get('value')
         rain_total = data.get('rain_totals', {}).get('value')
+        # EZ: was calculate_delta in my previous fix, see if this works
+        # pkt['rain'] = calculate_delta(rain_total, self.last_rain)
         pkt['rain'] = calculate_rain(rain_total, self.last_rain)
+        # EZ: removed rain_rate, see if this works
+        # pkt['rain_rate'] = data.get('rain_rate', {}).get('value')
         if self._debug_rain and self.last_rain != rain_total:
             loginf("rain_delta is %s (rain_total=%s, rain_last=%s)" %
                    (pkt['rain'], rain_total, self.last_rain))
@@ -481,6 +489,16 @@ class WH23xxDriver(weewx.drivers.AbstractDevice):
 
 class WH23xxStation(object):
     # usb values obtained from 'sudo lsusb -v'
+    # EZ My USB ids for Renkforce 2300 are
+    # Device Descriptor:
+    #   idVendor           0x10c4 Cygnal Integrated Products, Inc.
+    #   idProduct          0x8468
+    # Endpoint Descriptor:
+    #    bEndpointAddress     0x82  EP 2 IN
+    #    wMaxPacketSize     0x0040  1x 64 bytes
+    #  Endpoint Descriptor:
+    #    bEndpointAddress     0x02  EP 2 OUT
+    #    wMaxPacketSize     0x0040  1x 64 bytes
     USB_ENDPOINT_IN = 0x82
     USB_ENDPOINT_OUT = 0x02
     USB_PACKET_SIZE = 0x40 # 64 bytes
@@ -549,6 +567,7 @@ class WH23xxStation(object):
     ITEM_DATE = 0x80
 
     def __init__(self):
+        # EZ See above Device Descriptor
         self.vendor_id = 0x10c4
         self.product_id = 0x8468
         self.iface = 0
@@ -585,7 +604,7 @@ class WH23xxStation(object):
         try:
             self.devh.claimInterface(self.iface)
             self.devh.setAltInterface(self.iface)
-        except usb.USBError, e:
+        except usb.USBError as e:
             logerr("Unable to claim USB interface %s: %s" % (self.iface, e))
             self.close()
             raise weewx.WeeWxIOError(e)
@@ -594,7 +613,7 @@ class WH23xxStation(object):
         if self.devh:
             try:
                 self.devh.releaseInterface()
-            except (ValueError, usb.USBError), e:
+            except (ValueError, usb.USBError) as e:
                 logerr("release interface failed: %s" % e)
             self.devh = None
 
@@ -608,18 +627,24 @@ class WH23xxStation(object):
             try:
                 self.devh.reset()
                 break
-            except usb.USBError, e:
+            except usb.USBError as e:
                 logdbg("usb reset failed: %s" % e)
                 time.sleep(2)
 
     @staticmethod
     def _find_dev(vendor_id, product_id):
         """Find the vendor and product ID on the USB."""
+        logdbg("_find_dev: Looking for vendor_id %s and product_id %s..." % (vendor_id, product_id))
         for bus in usb.busses():
             for dev in bus.devices:
                 if dev.idVendor == vendor_id and dev.idProduct == product_id:
-                    loginf('Found device on USB bus=%s device=%s' %
-                           (bus.dirname, dev.filename))
+                    # EZ: dirname and filename fail on my RPi
+                    #loginf('Found device on USB bus=%s device=%s' % (bus.dirname, dev.filename))
+                    # EZ: So replaced with code that works for me
+                    xdev = usb.core.find(idVendor=dev.idVendor, idProduct=dev.idProduct)
+                    xdev._manufacturer = usb.util.get_string(xdev, xdev.iManufacturer)
+                    xdev._product = usb.util.get_string(xdev, xdev.iProduct)
+                    loginf('Found the device: Manufacturer %s and Product %s' % (xdev._manufacturer, xdev._product))
                     return dev
         return None
 
@@ -684,7 +709,6 @@ class WH23xxStation(object):
         # contains the READ_RECORD reply, the size of the reply data, the
         # reply data, and a checksum.
         tmp = []
-        record_size = 0
         buf = self.devh.interruptRead(
             self.USB_ENDPOINT_IN,
             self.USB_PACKET_SIZE,
@@ -825,7 +849,7 @@ class WH23xxStation(object):
             mapping = WH23xxStation.ITEM_MAPPING.get(item)
             if mapping:
                 if i + mapping[1] - 1 >= len(raw):
-                    logerr("not enough bytes for %s: idx=%s nbytes=%s bytes=%s"
+                    logerr("decode_weather_data: not enough bytes for %s: idx=%s nbytes=%s bytes=%s"
                            % (mapping[0], i, mapping[1], raw))
                     return dict()
                 # bytes are decoded MSB first, then function is applied
@@ -833,7 +857,7 @@ class WH23xxStation(object):
                 obs['value'] = _decode_bytes(raw, i, mapping[1], mapping[2])
                 i += mapping[1]
             else:
-                logerr("no mapping for item id 0x%02x (0x%02x)"
+                logerr("decode_weather_data: no mapping for item id 0x%02x (0x%02x)"
                        " at index %s of %s" % (item, item_raw, i-1, _fmt(raw)))
                 return dict()
 
@@ -853,7 +877,7 @@ class WH23xxStation(object):
                 obs['value'] == 0xffffff / 10.0):
                 obs['value'] = None
 
-            logdbg("%s: %s (0x%02x 0x%02x)" % (label, obs, item, item_raw))
+            logdbg("decode_weather_data: %s: %s (0x%02x 0x%02x)" % (label, obs, item, item_raw))
             data[label] = obs
         return data
 
@@ -867,10 +891,10 @@ class WH23xxStation(object):
         #  wind_dir: 0x1f specified, using 0x1ff
         data = dict()
         if not raw:
-            logdbg("empty raw data")
+            logdbg("decode_history_record: empty raw data")
             return data
         if len(raw) != 18:
-            logdbg("wrong number of bytes in raw data: %s != 18" % len(raw))
+            logdbg("decode_history_record: wrong number of bytes in raw data: %s != 18" % len(raw))
             return data
         x = ((raw[0] & 0x01) << 8) + raw[1]
         data['wind_dir'] = None if x == 0x1ff else x # compass degree
@@ -976,14 +1000,17 @@ if __name__ == '__main__':
         keys = x.keys() if not display_keys else list(set(x.keys()) & set(display_keys))
         keys.sort()
         for k in keys:
-            print "%s: %s" % (k, x[k])
+            print("print_info: %s: %s" % (k, x[k]))
 
     import optparse
+    import weeutil
 
     usage = """%prog [options] [--debug] [--help]"""
 
-    syslog.openlog('wh23xx', syslog.LOG_PID | syslog.LOG_CONS)
-    syslog.setlogmask(syslog.LOG_UPTO(syslog.LOG_INFO))
+    weewx.debug = 1
+
+    weeutil.logger.setup('wh23xx')
+
     parser = optparse.OptionParser(usage=usage)
     parser.add_option('--version', dest='version', action='store_true',
                       help='display driver version')
@@ -994,11 +1021,11 @@ if __name__ == '__main__':
     (options, args) = parser.parse_args()
 
     if options.version:
-        print "driver version %s" % DRIVER_VERSION
+        print("driver version %s" % DRIVER_VERSION)
         exit(1)
 
     if options.debug:
-        syslog.setlogmask(syslog.LOG_UPTO(syslog.LOG_DEBUG))
+        weewx.debug = 1
 
     if options.action == 'info':
         with WH23xxStation() as s:
@@ -1011,8 +1038,8 @@ if __name__ == '__main__':
             while True:
                 raw = s.get_current()
                 if options.debug:
-                    print _fmt(raw)
-                print WH23xxStation.decode_weather_data(raw)
+                    print(_fmt(raw))
+                print(WH23xxStation.decode_weather_data(raw))
                 time.sleep(5)
     elif options.action == 'sync-time':
         with WH23xxStation() as s:
@@ -1023,25 +1050,25 @@ if __name__ == '__main__':
     elif options.action == 'test-decode-info':
         for row in INFO_DATA:
             raw = [int(x, 16) for x in row.split()]
-            print _fmt(raw)
-            print WH23xxStation.decode_station_info(raw)
+            print(_fmt(raw))
+            print(WH23xxStation.decode_station_info(raw))
     elif options.action == 'test-decode-current':
         for row in CURRENT_DATA:
             raw = [int(x, 16) for x in row.split()]
-            print _fmt(raw)
-            print WH23xxStation.decode_weather_data(raw)
+            print(_fmt(raw))
+            print(WH23xxStation.decode_weather_data(raw))
     elif options.action == 'test-decode-history':
         for row in HISTORY_DATA:
             raw = [int(x, 16) for x in row.split()]
-            print _fmt(raw)
-            print WH23xxStation.decode_history_record(raw)
+            print(_fmt(raw))
+            print(WH23xxStation.decode_history_record(raw))
     elif options.action == 'eeprom-time':
         with WH23xxStation() as s:
             raw = s._read_eeprom(0x02c8, 8)
-            print _fmt(raw[0:8])
-            print "%04d.%02d.%02d %02d:%02d %ss" % (
+            print(_fmt(raw[0:8]))
+            print("%04d.%02d.%02d %02d:%02d %ss" % (
                 2000 + raw[0], raw[1], raw[2], raw[3], raw[4],
-                raw[5] + raw[6] * 256)
+                raw[5] + raw[6] * 256))
     elif options.action == 'dump':
         with WH23xxStation() as s:
             size = 0x20
@@ -1049,11 +1076,11 @@ if __name__ == '__main__':
                 for n in range(0, 3):
                     try:
                         raw = s._read_eeprom(i, 0x20)
-                        print "%04x" % i, _fmt(raw[:size])
+                        print("%04x" % i, _fmt(raw[:size]))
                         break
-                    except Exception, e:
-                        print "failed read %d of 3 for 0x%04x: %s" % (n+1, i, e)
-                        print "waiting 3 seconds before retry"
+                    except Exception as e:
+                        print("failed read %d of 3 for 0x%04x: %s" % (n+1, i, e))
+                        print("waiting 3 seconds before retry")
                         time.sleep(3)
                 else:
                     raise Exception("retries failed")
